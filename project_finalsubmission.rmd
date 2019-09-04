@@ -1,0 +1,257 @@
+---
+title: "R Notebook"
+output:
+  word_document: default
+  html_notebook: default
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+# reading data
+
+train = read.csv("C:\\Users\\monis\\Desktop\\Data Vizualisation\\train_values.csv")
+trial_rec= read.csv("C:\\Users\\monis\\Downloads\\recipe_metadata (1).csv")
+train_labels= read.csv("C:\\Users\\monis\\Desktop\\Data_Mining\\Project\\train_labels.csv")
+
+
+```
+
+
+```{r}
+# identifying "standard recepie"
+
+data <- within(trial_rec,  id <- paste(trial_rec$pre_rinse, trial_rec$caustic, trial_rec$intermediate_rinse, trial_rec$acid, trial_rec$final_rinse,sep=""))
+rec=data.frame(process_id=trial_rec$process_id,recipe=data$id)
+Recipe=rec
+```
+
+```{r}
+# computing median target values
+library(magrittr)
+library(dplyr)
+
+preds_mean_all <- train %>%
+  distinct(process_id, object_id) %>% 
+  left_join(train_labels) %>% 
+  rename(target = final_rinse_total_turbidity_liter) %>% 
+  filter(target<7000000) %>% 
+  group_by(object_id) %>% 
+  summarise(
+    median_target = median(target)
+  )
+
+```
+
+```{r}
+
+# computing summary statistics for data
+convert_summary <- function(train, PHASES){
+  train %>% 
+    filter(phase%in%PHASES) %>%
+    group_by(process_id, object_id) %>% 
+    summarise(
+      the_target = median(supply_flow*return_turbidity),
+      return_turbidity = median(return_turbidity),
+      return_temperature = median(return_temperature),
+      supply_flow_median = median(supply_flow),
+      pipeline = unique(pipeline),
+      supply_flow_diff = median(supply_flow),
+      return_conductivity = median(return_conductivity),
+      supply_pressure =median(supply_pressure),
+      tank_level_pre_rinse = median(tank_level_pre_rinse),
+      supply_pump  =median(supply_pump ==  'True'),
+      tank_concentration_caustic =median(tank_concentration_caustic),
+      object_low_level = median(object_low_level=='True'),
+      tank_level_clean_water = median( tank_level_clean_water),
+      return_flow1  = median(return_flow ),
+      return_drain = median(return_drain=='True'),
+    ) %>% ungroup() %>% 
+    left_join(preds_mean_all, by = 'object_id') %>% 
+    left_join(Recipe,  by = "process_id") 
+} 
+```
+
+```{r}
+
+# join with final turbidity values and remove outliers
+convert_train_summary <- function(data,...){
+  convert_summary(data,...) %>% 
+    left_join(train_labels, by = "process_id") %>% 
+    rename(target = final_rinse_total_turbidity_liter) %>%  
+    filter(target< 7000000) 
+}
+
+
+```
+
+
+```{r}
+
+
+# filtering for acid phase predictions
+#0001 # final acid data
+data_acid <- convert_train_summary(train, 'acid')
+
+
+```
+
+```{r}
+
+
+# train test validation 
+
+train.index <- sample(row.names(data_acid), dim(data_acid)[1] * 0.6)
+train_acid <- data_acid[train.index,]
+validation.index <- setdiff(row.names(data_acid),train.index)
+v_acid <- data_acid[validation.index, ]
+
+
+
+```
+
+
+```{r}
+
+# Train  and Predict with Random Forest Regression model #------------------------------------------------------------
+library(ranger)
+rf_acid = ranger(formula = target~., data = train_acid, 
+     seed = 100, importance = 'impurity',num.trees = 700, 
+     mtry = 6)
+
+## S3 method for class 'ranger' prediction for v_acid 
+pred_acid=predict(rf_acid, data = v_acid, predict.all = FALSE,
+        num.trees = rf_acid$num.trees, type = "response",
+        se.method = "infjack", quantiles = c(0.1, 0.5, 0.9), seed = 100)
+```
+
+
+
+```{r}
+
+## performance evaluvation 
+
+library(MLmetrics)
+library(vegan)
+MAPE(pred_acid$predictions, v_acid$target)
+MAE(pred_acid$predictions, v_acid$target)
+MedianAE(pred_acid$predictions, v_acid$target)
+y=R2_Score(pred_acid$predictions, v_acid$target)
+R2_Score(pred_acid$predictions, v_acid$target)
+RsquareAdj(y, 314,5)
+RMSE(pred_acid$predictions, v_acid$target)
+
+
+```
+
+
+```{r}
+pred_acid$predictions
+```
+
+
+```{r}
+###########  GRADIENT BOOSTED TREES #######################
+
+
+library(gbm)          # basic implementation
+library(xgboost)      # a faster implementation of gbm
+library(caret)        # an aggregator package for performing many machine learning models
+library(h2o)          # a java-based platform
+library(pdp)          # model visualization
+library(ggplot2)      # model visualization
+library(lime)         # model visualization
+
+
+gbm.fit <- gbm(
+  formula = target ~ .,
+  distribution = "gaussian",
+  data = train_acid,
+  n.trees = 5000,
+  interaction.depth = 1,
+  shrinkage = 0.001,
+  cv.folds = 5,
+  n.cores = NULL, # will use all cores by default
+  verbose = FALSE
+)  
+
+print(gbm.fit)
+sqrt(min(gbm.fit$cv.error))
+gbm.perf(gbm.fit, method = "cv")
+
+```
+
+
+```{r}
+
+
+
+### TUNING THE BOOSTED TREE 
+## train GBM model
+gbm.fit2 <- gbm(
+  formula = the_target ~ .,
+  distribution = "gaussian",
+  data = data_acid,
+  n.trees = 5000,
+  interaction.depth = 3,
+  shrinkage = 0.1,
+  cv.folds = 5,
+  n.cores = NULL, # will use all cores by default
+  verbose = FALSE
+)  
+
+# find index for n trees with minimum CV error
+min_MSE <- which.min(gbm.fit2$cv.error)
+
+# get MSE and compute RMSE
+sqrt(gbm.fit2$cv.error[min_MSE])
+## [1] 23112.1
+
+# plot loss function as a result of n trees added to the ensemble
+gbm.perf(gbm.fit, method = "cv")
+
+
+```
+
+
+```{r}
+
+# tuned BOOSTED TREE
+## TUNING to 746 trees 
+gbm.fit3 <- gbm(
+  formula = target ~ .,
+  distribution = "gaussian",
+  data = data_acid,
+  n.trees = 746,
+  interaction.depth = 3,
+  shrinkage = 0.1,
+  cv.folds = 5,
+  n.cores = NULL, # will use all cores by default
+  verbose = FALSE
+) 
+
+sqrt(gbm.fit3$cv.error[min_MSE])
+```
+
+
+
+```{r}
+
+## performance evaluvation 
+gbm.test<-predict(gbm.fit3,newdata = v_acid,n.trees = 239)
+MAPE(gbm.test, v_acid$target)
+MAE(gbm.test, v_acid$target)
+MedianAE(gbm.test, v_acid$target)
+y=R2_Score(gbm.test, v_acid$target)
+R2_Score(gbm.test, v_acid$target)
+RsquareAdj(y, 314,5)
+RMSE(gbm.test, v_acid$target)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
